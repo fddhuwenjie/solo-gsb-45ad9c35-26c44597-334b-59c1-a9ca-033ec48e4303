@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import json
+import uuid
 from decimal import Decimal
 
 from fastapi import FastAPI, Request
@@ -21,8 +22,20 @@ from .errors import (
     PayloadTooLargeError,
     ProtocolNotFoundError,
     ProtocolVersionConflictError,
+    SessionNotFoundError,
+    SessionOffsetConflictError,
 )
-from .models import DecodeRequest, DecodeResponse, EncodeRequest, EncodeResponse, ProtocolDefinition
+from .models import (
+    DecodeRequest,
+    DecodeResponse,
+    EncodeRequest,
+    EncodeResponse,
+    ProtocolDefinition,
+    SessionChunkRequest,
+    SessionChunkResponse,
+    SessionCreateRequest,
+    SessionStateResponse,
+)
 
 
 def _error_body(code: str, message: str, details=None) -> dict:
@@ -49,6 +62,56 @@ def _validation_errors(errors: list[dict]) -> dict:
                 detail["details"] = inner.details
         details.append(detail)
     return _error_body("VALIDATION_ERROR", "request validation failed", details)
+
+
+def _shift_decode_result(result: dict, base: int) -> dict:
+    """Re-base buffer-relative decoder offsets to session-absolute positions."""
+    frames = [dict(f, start=f["start"] + base, end=f["end"] + base) for f in result["frames"]]
+    discarded = []
+    for interval in result["discarded"]:
+        attempts = []
+        for attempt in interval.get("failed_attempts", []):
+            shifted = dict(attempt)
+            if "start" in shifted:
+                shifted["start"] += base
+            detail = shifted.get("detail")
+            if isinstance(detail, dict) and "raw_offset" in detail:
+                shifted["detail"] = dict(detail, raw_offset=detail["raw_offset"] + base)
+            attempts.append(shifted)
+        discarded.append(
+            dict(
+                interval,
+                start=interval["start"] + base,
+                end=interval["end"] + base,
+                failed_attempts=attempts,
+            )
+        )
+    tail = dict(
+        result["tail"],
+        start=result["tail"]["start"] + base,
+        end=result["tail"]["end"] + base,
+    )
+    return {"frames": frames, "discarded": discarded, "tail": tail}
+
+
+def _session_state_body(row) -> dict:
+    tail_b64 = row["tail"] or ""
+    tail_len = len(base64.b64decode(tail_b64)) if tail_b64 else 0
+    next_offset = row["next_offset"]
+    return {
+        "session_id": row["session_id"],
+        "protocol_id": row["protocol_id"],
+        "version": row["version"],
+        "next_offset": next_offset,
+        "frames_total": row["frames_total"],
+        "tail": {
+            "start": next_offset - tail_len,
+            "end": next_offset,
+            "payload_b64": tail_b64,
+        },
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -198,6 +261,138 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
         validated = DecodeResponse.model_validate(response)
         db.put_cached(proto.protocol_id, resolved_version, input_digest, validated)
+        return response
+
+    # ---- acquisition sessions: chunked byte streams ------------------------
+
+    @app.post("/sessions", status_code=201, response_model=SessionStateResponse)
+    async def create_session(req: SessionCreateRequest) -> dict:
+        db: Database = app.state.db
+        found = db.find_protocol(req.protocol_id, req.version)
+        if found is None:
+            raise ProtocolNotFoundError(
+                message=f"protocol '{req.protocol_id}' version {req.version} not found"
+            )
+        proto, resolved_version = found
+        session_id = uuid.uuid4().hex
+        db.create_session(session_id, proto.protocol_id, resolved_version)
+        return _session_state_body(db.get_session(session_id))
+
+    @app.get("/sessions/{session_id}", response_model=SessionStateResponse)
+    async def session_progress(session_id: str) -> dict:
+        row = app.state.db.get_session(session_id)
+        if row is None:
+            raise SessionNotFoundError(message=f"session '{session_id}' not found")
+        return _session_state_body(row)
+
+    @app.post("/sessions/{session_id}/chunks", response_model=SessionChunkResponse)
+    async def append_chunk(session_id: str, req: SessionChunkRequest) -> dict:
+        db: Database = app.state.db
+        row = db.get_session(session_id)
+        if row is None:
+            raise SessionNotFoundError(message=f"session '{session_id}' not found")
+
+        try:
+            chunk = base64.b64decode(req.payload_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise InvalidBase64Error(message=f"payload_b64 is not valid base64: {exc}") from exc
+        chunk_sha = hashlib.sha256(chunk).hexdigest()
+        next_offset = row["next_offset"]
+
+        # Idempotent replay: the most recent chunk resent with the same offset
+        # and content returns the stored response without re-producing output.
+        if row["last_chunk_offset"] is not None and req.offset == row["last_chunk_offset"]:
+            if chunk_sha == row["last_chunk_sha256"]:
+                return json.loads(row["last_response"])
+            raise SessionOffsetConflictError(
+                message=(
+                    f"offset {req.offset} was already received for session "
+                    f"'{session_id}' with different content"
+                ),
+                details={
+                    "session_id": session_id,
+                    "offset": req.offset,
+                    "next_offset": next_offset,
+                },
+            )
+
+        if req.offset != next_offset:
+            raise SessionOffsetConflictError(
+                message=(
+                    f"chunk offset {req.offset} does not match the receive offset "
+                    f"{next_offset} of session '{session_id}'"
+                ),
+                details={
+                    "session_id": session_id,
+                    "offset": req.offset,
+                    "expected_offset": next_offset,
+                },
+            )
+
+        # Prepend the pending raw tail from the previous chunk, then run the
+        # same resynchronising decoder on the concatenated buffer.
+        tail_bytes = base64.b64decode(row["tail"]) if row["tail"] else b""
+        combined = tail_bytes + chunk
+        if len(combined) > settings.max_decode_bytes:
+            raise PayloadTooLargeError(
+                message=(
+                    f"pending tail + chunk is {len(combined)} bytes; limit is "
+                    f"{settings.max_decode_bytes} bytes"
+                ),
+                details={"size": len(combined), "limit": settings.max_decode_bytes},
+            )
+
+        found = db.find_protocol(row["protocol_id"], row["version"])
+        if found is None:  # pragma: no cover - registered versions are immutable
+            raise ProtocolNotFoundError(
+                message=f"protocol '{row['protocol_id']}' version {row['version']} not found"
+            )
+        proto, resolved_version = found
+
+        # Decode errors (structured 422) propagate without advancing the offset.
+        result = decode_stream(combined, proto)
+
+        base = next_offset - len(tail_bytes)
+        shifted = _shift_decode_result(result, base)
+        new_next_offset = next_offset + len(chunk)
+        response = {
+            "session_id": session_id,
+            "protocol_id": proto.protocol_id,
+            "version": resolved_version,
+            "frames": shifted["frames"],
+            "discarded": shifted["discarded"],
+            "tail": shifted["tail"],
+            "frame_count": len(shifted["frames"]),
+            "chunk_bytes": len(chunk),
+            "next_offset": new_next_offset,
+        }
+        stored = SessionChunkResponse.model_validate(response).model_dump_json()
+        applied = db.apply_session_chunk(
+            session_id,
+            expected_offset=next_offset,
+            new_offset=new_next_offset,
+            tail_b64=shifted["tail"]["payload_b64"],
+            frames_added=len(shifted["frames"]),
+            chunk_offset=req.offset,
+            chunk_sha256=chunk_sha,
+            response_json=stored,
+        )
+        if not applied:
+            # A concurrent append won the race; only an identical retry replays.
+            current = db.get_session(session_id)
+            if (
+                current is not None
+                and current["last_chunk_offset"] == req.offset
+                and current["last_chunk_sha256"] == chunk_sha
+            ):
+                return json.loads(current["last_response"])
+            raise SessionOffsetConflictError(
+                message=(
+                    f"session '{session_id}' advanced while this chunk was being "
+                    "processed; the chunk was not applied"
+                ),
+                details={"session_id": session_id, "offset": req.offset},
+            )
         return response
 
     @app.post(

@@ -295,6 +295,45 @@ class DecodeResponse(BaseModel):
     cached: bool = False
 
 
+class SessionCreateRequest(BaseModel):
+    protocol_id: str
+    version: int = Field(
+        ..., ge=1, description="Exact registered protocol version to pin for the whole session"
+    )
+
+
+class SessionChunkRequest(BaseModel):
+    offset: int = Field(
+        ..., ge=0, description="Expected receive offset: cumulative session bytes before this chunk"
+    )
+    payload_b64: str = Field(
+        ..., min_length=1, description="Base64-encoded non-empty raw byte chunk"
+    )
+
+
+class SessionStateResponse(BaseModel):
+    session_id: str
+    protocol_id: str
+    version: int
+    next_offset: int = Field(..., description="Cumulative bytes received; offset of the next chunk")
+    frames_total: int
+    tail: Tail
+    created_at: str
+    updated_at: str
+
+
+class SessionChunkResponse(BaseModel):
+    session_id: str
+    protocol_id: str
+    version: int
+    frames: list[DecodedFrame]
+    discarded: list[DiscardedInterval]
+    tail: Tail
+    frame_count: int
+    chunk_bytes: int
+    next_offset: int
+
+
 class EncodeRequest(BaseModel):
     protocol_id: str
     version: int | None = Field(None, ge=1, description="Defaults to the latest registered version")

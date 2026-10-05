@@ -1,4 +1,6 @@
-"""SQLite storage for protocol declarations and idempotent decode results."""
+"""SQLite storage for protocol declarations, idempotent decode results and
+streaming acquisition sessions (receive offset + pending tail + last response,
+persisted together so sessions survive restarts)."""
 from __future__ import annotations
 
 import json
@@ -26,6 +28,20 @@ CREATE TABLE IF NOT EXISTS decode_cache (
     result          TEXT NOT NULL,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (protocol_id, version, input_sha256)
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id        TEXT PRIMARY KEY,
+    protocol_id       TEXT NOT NULL,
+    version           INTEGER NOT NULL,
+    next_offset       INTEGER NOT NULL DEFAULT 0,
+    tail              TEXT NOT NULL DEFAULT '',
+    frames_total      INTEGER NOT NULL DEFAULT 0,
+    last_chunk_offset INTEGER,
+    last_chunk_sha256 TEXT,
+    last_response     TEXT,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
 
@@ -132,3 +148,58 @@ class Database:
                 "(protocol_id, version, input_sha256, result) VALUES (?, ?, ?, ?)",
                 (protocol_id, version, input_sha, payload),
             )
+
+    # ----- acquisition sessions ---------------------------------------------
+
+    def create_session(self, session_id: str, protocol_id: str, version: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO sessions (session_id, protocol_id, version) VALUES (?, ?, ?)",
+                (session_id, protocol_id, version),
+            )
+
+    def get_session(self, session_id: str) -> sqlite3.Row | None:
+        cur = self.conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        return cur.fetchone()
+
+    def apply_session_chunk(
+        self,
+        session_id: str,
+        *,
+        expected_offset: int,
+        new_offset: int,
+        tail_b64: str,
+        frames_added: int,
+        chunk_offset: int,
+        chunk_sha256: str,
+        response_json: str,
+    ) -> bool:
+        """Persist receive offset + pending tail + this response in one write.
+
+        The ``WHERE next_offset = ?`` guard makes concurrent appends safe: only
+        the writer that still observes the expected offset advances the session;
+        the loser affects no rows and the caller decides replay vs. conflict.
+        """
+        cur = self.conn.execute(
+            "UPDATE sessions SET next_offset = ?, tail = ?, "
+            "frames_total = frames_total + ?, last_chunk_offset = ?, "
+            "last_chunk_sha256 = ?, last_response = ?, updated_at = datetime('now') "
+            "WHERE session_id = ? AND next_offset = ?",
+            (
+                new_offset,
+                tail_b64,
+                frames_added,
+                chunk_offset,
+                chunk_sha256,
+                response_json,
+                session_id,
+                expected_offset,
+            ),
+        )
+        if cur.rowcount != 1:
+            self.conn.rollback()
+            return False
+        self.conn.commit()
+        return True

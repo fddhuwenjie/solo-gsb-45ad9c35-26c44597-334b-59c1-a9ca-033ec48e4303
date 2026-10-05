@@ -17,6 +17,12 @@
   转义并添加同步字节；结果在返回前强制经现有解码器回读校验，字段不一致直接拒绝返回。
 - **不完整尾部保留**：流末尾尚未凑齐的帧（含 dangling 转义符、只出现一半的同步头）
   原样保留在 `tail` 中返回，可直接与后续到达的字节拼接后再次提交。
+- **采集会话（跨分片流式解码）**：`POST /sessions` 创建会话并**固定协议确切版本**，
+  随后用 `POST /sessions/{id}/chunks` 分批追加 base64 分片；服务自动把上次未决的
+  原始尾部接到新分片前再解码，每次只返回**本次新确定**的帧与丢弃区间（起止偏移统一为
+  会话累计字节位置），并返回新的待决尾部与下一偏移。接收偏移、尾部与响应一起持久化到
+  SQLite，服务重启后可继续；最近一次分片按同一偏移+内容重发返回原响应，偏移相同但内容
+  不同或乱序提交返回 409 且不改状态。`GET /sessions/{id}` 查询进度。
 - **丢弃区间审计**：每次跳过都返回 `[start, end)` 区间与各候选的失败原因
   （`length_out_of_bounds` / `crc_failed` / `malformed_escape`）。
 - **结果复用**：同一协议版本 + 输入字节 SHA-256 摘要命中 SQLite 缓存，响应中
@@ -192,6 +198,139 @@ curl -s -X POST localhost:8000/encode -H 'Content-Type: application/json' -d '{
 - 返回前强制把 `wire_b64` 送入现有 `/decode` 解码器回读；帧数不为 1、尾部非空或任一
   字段值与请求不一致时返回 `ENCODE_VERIFICATION_FAILED` 422，不下发该帧。
 
+### 4. 采集会话：跨分片流式解码（分批到达的字节流）
+
+现场字节流分批到达时，用会话把多次分片拼成一条连续流：服务为每个会话保存**累计接收
+偏移**与**待决尾部**（上次没凑齐的原始字节），新分片到达时自动把尾部拼在新数据前，
+再用同一套重同步解码器解码；每次响应只携带**本次新确定**的帧与丢弃区间，
+`start`/`end` 全部为会话级累计偏移。调用方只需发送新到达的字节，无需自己拼接。
+
+#### 4.1 创建会话（固定协议确切版本）
+
+```bash
+curl -s -X POST localhost:8000/sessions -H 'Content-Type: application/json' -d '{
+  "protocol_id": "sensor-line",
+  "version": 1
+}'
+```
+
+`version` 必填：会话把该确切版本钉死，之后注册新版本不影响本会话。响应（201）：
+
+```json
+{
+  "session_id": "fb63f6becc99488fb89eeccc8fe1581b",
+  "protocol_id": "sensor-line",
+  "version": 1,
+  "next_offset": 0,
+  "frames_total": 0,
+  "tail": {"start": 0, "end": 0, "payload_b64": ""},
+  "created_at": "2026-10-05 16:22:19",
+  "updated_at": "2026-10-05 16:22:19"
+}
+```
+
+#### 4.2 追加分片（自动拼接上次尾部）
+
+`POST /sessions/{session_id}/chunks`，请求体提交**期望接收偏移** `offset`（首片为 0，
+之后等于上一响应的 `next_offset`）和**非空** base64 分片 `payload_b64`。下面把两帧
+（线上共 22 字节）切成 16 + 6 两片，第二帧横跨分片边界：
+
+```bash
+SID=fb63f6becc99488fb89eeccc8fe1581b
+
+# 分片 1：完整帧 1 + 帧 2 的前 5 字节
+curl -s -X POST localhost:8000/sessions/$SID/chunks -H 'Content-Type: application/json' -d '{
+  "offset": 0,
+  "payload_b64": "qlUBAwkpCQB1mwCqVQID/w=="
+}'
+```
+
+响应：帧 1 完成（`"start": 0, "end": 11`），帧 2 的前 5 字节留在新尾部：
+
+```json
+{
+  "session_id": "fb63f6becc99488fb89eeccc8fe1581b",
+  "protocol_id": "sensor-line",
+  "version": 1,
+  "frames": [
+    {"start": 0, "end": 11, "logical_length": 9, "sequence": 1, "crc_ok": true,
+     "fields": [{"name": "temp", "offset": 2, "size": 2, "raw": 2345, "value": 23.45, "signed": true}]}
+  ],
+  "discarded": [],
+  "tail": {"start": 11, "end": 16, "payload_b64": "qlUCA/8="},
+  "frame_count": 1,
+  "chunk_bytes": 16,
+  "next_offset": 16
+}
+```
+
+```bash
+# 分片 2：帧 2 的剩余 6 字节（服务自动把上面的 tail 拼在前面再解码）
+curl -s -X POST localhost:8000/sessions/$SID/chunks -H 'Content-Type: application/json' -d '{
+  "offset": 16,
+  "payload_b64": "agkAqooA"
+}'
+```
+
+响应：帧 2 在会话绝对偏移 `[11, 22)` 处解出，尾部清空：
+
+```json
+{
+  "frames": [
+    {"start": 11, "end": 22, "logical_length": 9, "sequence": 2, "crc_ok": true,
+     "fields": [{"name": "temp", "offset": 2, "size": 2, "raw": 65386, "value": -1.5, "signed": true}]}
+  ],
+  "discarded": [],
+  "tail": {"start": 22, "end": 22, "payload_b64": ""},
+  "frame_count": 1,
+  "chunk_bytes": 6,
+  "next_offset": 22
+}
+```
+
+#### 4.3 重试与乱序（幂等）
+
+- **重发最近一次分片**（同一 `offset` + 同一内容）：返回原响应，不重复产出、不推进
+  状态——网络重试是安全的。上例中把分片 2 原样再发一次，返回与 4.2 完全相同的响应。
+- **同一偏移、不同内容**：`409 SESSION_OFFSET_CONFLICT`，状态不变：
+
+  ```bash
+  curl -s -X POST localhost:8000/sessions/$SID/chunks -H 'Content-Type: application/json' -d '{
+    "offset": 16,
+    "payload_b64": "AAAAAAAA"
+  }'
+  # {"error": {"code": "SESSION_OFFSET_CONFLICT", "message": "offset 16 was already received ...", ...}}
+  ```
+
+- **乱序/并发提交**（`offset` 不等于会话当前 `next_offset`，或并发竞争落败）：
+  同样 `409 SESSION_OFFSET_CONFLICT` 且不改状态；并发下同一偏移只有两个相同内容的
+  请求会都拿到原响应，不同内容只有一个成功。
+- **不推进偏移的失败**：拼接后（尾部 + 新分片）超过 `RESYNC_MAX_DECODE_BYTES` 返回
+  413；解码报错（如 `AMBIGUOUS_FRAME`、`FIELD_OUT_OF_BOUNDS`）返回 422。两者都不改
+  会话状态，修正后可按原偏移重发。
+
+#### 4.4 进度查询与重启续传
+
+```bash
+curl -s localhost:8000/sessions/$SID
+```
+
+```json
+{
+  "session_id": "fb63f6becc99488fb89eeccc8fe1581b",
+  "protocol_id": "sensor-line",
+  "version": 1,
+  "next_offset": 22,
+  "frames_total": 2,
+  "tail": {"start": 22, "end": 22, "payload_b64": ""},
+  "created_at": "2026-10-05 16:22:19",
+  "updated_at": "2026-10-05 16:22:19"
+}
+```
+
+接收偏移、待决尾部与最近一次响应**一起持久化**在 SQLite（compose 的 `resync-data`
+卷）中：服务重启后会话可继续追加，最近一次分片的重发在重启后仍返回原响应。
+
 ## 协议声明字段
 
 | 字段 | 说明 |
@@ -233,8 +372,10 @@ curl -s -X POST localhost:8000/encode -H 'Content-Type: application/json' -d '{
 | 422 | `LENGTH_NOT_ENCODABLE` | `/encode`：长度值超出长度字段位宽 |
 | 422 | `ENCODE_VERIFICATION_FAILED` | `/encode`：解码器回读结果与请求不一致（帧拒绝返回） |
 | 404 | `PROTOCOL_NOT_FOUND` | 协议 ID / 版本不存在 |
+| 404 | `SESSION_NOT_FOUND` | 会话 ID 不存在 |
 | 409 | `PROTOCOL_VERSION_CONFLICT` | 同 ID+版本已存在但定义不同 |
-| 413 | `PAYLOAD_TOO_LARGE` | 超 `RESYNC_MAX_DECODE_BYTES` |
+| 409 | `SESSION_OFFSET_CONFLICT` | 分片偏移与内容冲突：同偏移不同内容、乱序或并发竞争落败（状态不变） |
+| 413 | `PAYLOAD_TOO_LARGE` | 超 `RESYNC_MAX_DECODE_BYTES`（会话为尾部+新分片拼接后超限，不推进偏移） |
 
 ## API 一览
 
@@ -246,6 +387,9 @@ curl -s -X POST localhost:8000/encode -H 'Content-Type: application/json' -d '{
 | `GET` | `/protocols/{id}?version=N` | 读取协议定义（省略版本取最新） |
 | `POST` | `/decode` | 解码 / 重同步 |
 | `POST` | `/encode` | 按已注册协议编码一帧（长度/CRC/转义/同步自动生成，回读校验） |
+| `POST` | `/sessions` | 创建采集会话，固定协议确切版本 |
+| `GET` | `/sessions/{id}` | 查询会话进度（累计偏移、待决尾部、累计帧数） |
+| `POST` | `/sessions/{id}/chunks` | 追加非空 base64 分片（自动拼接上次尾部，幂等重发） |
 
 同 ID + 版本重复提交**完全相同**的定义是幂等的（返回 `replaced=true`）；定义不同则 409。
 
@@ -258,7 +402,7 @@ app/
   crc.py       # 通用 CRC-16（反射/非反射）
   decoder.py   # 候选扫描、反转义、长度/CRC 校验、重同步与歧义判定
   encoder.py   # 字段写入（位域/定点反算/冲突检测）、长度与 CRC 派生、转义、回读校验
-  db.py        # SQLite：协议表 + (协议版本, 输入摘要) 结果缓存
+  db.py        # SQLite：协议表 + (协议版本, 输入摘要) 结果缓存 + 采集会话（偏移/尾部/最近响应）
   errors.py    # 结构化错误类型
   main.py      # FastAPI 路由与错误处理
 tests/         # pytest 用例（含构造 CRC 碰撞的歧义用例与编码回读校验）
@@ -278,4 +422,6 @@ pytest
 位域与有符号定点缩放、字段越界 422、CRC 碰撞歧义 422、缓存复用、版本冲突与解析；
 编码侧覆盖：定点精确反算、正负有符号值、位域共享字节与同值重叠、转义帧往返、
 LE/adjustment 长度值、不可精确表示 / min/max / 位宽 / 派生位置 / 长度溢出 422，
-以及解码器回读不一致拒绝返回。
+以及解码器回读不一致拒绝返回；会话侧覆盖：跨分片拼帧与一次性解码结果一致、
+绝对偏移、尾部结转、最近一次分片重发幂等、同偏移不同内容 / 乱序 / 并发竞争 409、
+拼接超限 413 与解码 422 不推进偏移、进度查询、版本钉死与重启续传。
