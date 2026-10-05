@@ -27,6 +27,20 @@ CREATE TABLE IF NOT EXISTS decode_cache (
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (protocol_id, version, input_sha256)
 );
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id        TEXT PRIMARY KEY,
+    protocol_id       TEXT NOT NULL,
+    version           INTEGER NOT NULL,
+    received_offset   INTEGER NOT NULL,
+    tail_b64          TEXT NOT NULL,
+    frames_total      INTEGER NOT NULL DEFAULT 0,
+    last_chunk_offset INTEGER,
+    last_chunk_sha256 TEXT,
+    last_response     TEXT NOT NULL,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 _init_lock = threading.Lock()
@@ -131,4 +145,56 @@ class Database:
                 "INSERT OR REPLACE INTO decode_cache "
                 "(protocol_id, version, input_sha256, result) VALUES (?, ?, ?, ?)",
                 (protocol_id, version, input_sha, payload),
+            )
+
+    # ----- collection sessions ---------------------------------------------
+
+    def create_session(self, session_id: str, protocol_id: str, version: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO sessions "
+                "(session_id, protocol_id, version, received_offset, tail_b64, "
+                " frames_total, last_chunk_offset, last_chunk_sha256, last_response) "
+                "VALUES (?, ?, ?, 0, '', 0, NULL, NULL, '')",
+                (session_id, protocol_id, version),
+            )
+
+    def get_session(self, session_id: str) -> sqlite3.Row | None:
+        cur = self.conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        return cur.fetchone()
+
+    def save_session_append(
+        self,
+        session_id: str,
+        *,
+        received_offset: int,
+        tail_b64: str,
+        frames_total: int,
+        last_chunk_offset: int,
+        last_chunk_sha: str,
+        last_response_json: str,
+    ) -> None:
+        """Durably commit one accepted append.
+
+        Offset, tail and the response of the last chunk move together in a
+        single transaction, so a crash/restart never loses or duplicates work.
+        """
+        with self.conn:
+            self.conn.execute(
+                "UPDATE sessions SET "
+                "received_offset = ?, tail_b64 = ?, frames_total = ?, "
+                "last_chunk_offset = ?, last_chunk_sha256 = ?, last_response = ?, "
+                "updated_at = datetime('now') "
+                "WHERE session_id = ?",
+                (
+                    received_offset,
+                    tail_b64,
+                    frames_total,
+                    last_chunk_offset,
+                    last_chunk_sha,
+                    last_response_json,
+                    session_id,
+                ),
             )

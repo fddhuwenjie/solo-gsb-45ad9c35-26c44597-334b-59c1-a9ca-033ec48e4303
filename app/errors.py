@@ -53,6 +53,16 @@ class ProtocolVersionConflictError(APIError):
     code = "PROTOCOL_VERSION_CONFLICT"
 
 
+class SessionNotFoundError(APIError):
+    status_code = 404
+    code = "SESSION_NOT_FOUND"
+
+
+class SessionAppendConflictError(APIError):
+    status_code = 409
+    code = "SESSION_APPEND_CONFLICT"
+
+
 class FieldOutOfBoundsError(DecodeError):
     code = "FIELD_OUT_OF_BOUNDS"
 

@@ -343,3 +343,62 @@ class EncodeResponse(BaseModel):
     length_value: int = Field(..., description="Raw value written into the length field")
     crc: str = Field(..., description="CRC-16 actually written, uppercase hex")
     fields: list[EncodedField]
+
+
+# ---------------------------------------------------------------------------
+# Streaming collection sessions
+# ---------------------------------------------------------------------------
+
+
+class CreateSessionRequest(BaseModel):
+    protocol_id: str
+    version: int = Field(
+        ..., ge=1, description="Exact registered protocol version pinned to this session"
+    )
+
+
+class SessionAppendRequest(BaseModel):
+    session_id: str
+    expected_offset: int = Field(
+        ..., ge=0, description="Session byte position at which this chunk must start"
+    )
+    chunk_b64: str = Field(
+        ..., min_length=1, description="Non-empty base64 fragment of the arriving raw stream"
+    )
+
+
+class SessionAppendResponse(BaseModel):
+    session_id: str
+    protocol_id: str
+    version: int
+    received_offset: int = Field(..., description="Session bytes accepted before this append")
+    next_offset: int = Field(..., description="Expected offset of the following append")
+    frames: list[DecodedFrame] = Field(
+        default_factory=list, description="Only frames newly confirmed by this append"
+    )
+    discarded: list[DiscardedInterval] = Field(
+        default_factory=list,
+        description="Only byte intervals newly discarded by this append (session offsets)",
+    )
+    tail: Tail = Field(..., description="New pending tail after this append (session offsets)")
+    frame_count: int = Field(..., description="Frames newly produced by this append")
+    frames_total: int = Field(..., description="Frames confirmed over the whole session so far")
+    replayed: bool = Field(
+        False,
+        description="True when the identical chunk at the identical offset is resent: "
+        "the stored response is returned verbatim and no frames are produced again",
+    )
+
+
+class SessionProgressResponse(BaseModel):
+    session_id: str
+    protocol_id: str
+    version: int
+    received_offset: int = Field(..., description="Total raw bytes durably accepted so far")
+    next_offset: int
+    tail: Tail
+    frames_total: int
+    last_chunk_offset: int | None
+    last_chunk_sha256: str | None
+    created_at: str
+    updated_at: str
